@@ -1,0 +1,72 @@
+options:
+  docker: true
+
+definitions:
+  steps:
+    - step: &build-image
+        name: Build Docker image for $BITBUCKET_REPO_FULL_NAME
+        image: atlassian/default-image:3
+        script:
+          - git clone -b $BITBUCKET_BRANCH git@bitbucket.org:ringover/cadence-brain.git
+          - git clone -b $BITBUCKET_BRANCH git@bitbucket.org:ringover/cadence-proto.git
+          - docker build -t $BITBUCKET_REPO_FULL_NAME .
+          - docker save --output tmp-image.docker $BITBUCKET_REPO_FULL_NAME
+        artifacts:
+          - tmp-image.docker
+    - step: &push-gcp
+        name: Push to GCP registry
+        image: google/cloud-sdk:alpine
+        script:
+          - docker load --input ./tmp-image.docker
+          # Authenticating with the service account key file
+          - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -d > ./gcloud-api-key.json
+          - gcloud auth activate-service-account --key-file gcloud-api-key.json
+          - gcloud config set project $GCP_PROJECT_ID
+          # Tag container & push
+          - export TAG=$(echo "$BITBUCKET_BRANCH")
+          - export SUFFIX=$([[ ! -z "$TAG" ]] && echo ":$TAG" || echo "")
+          - export IMAGE_NAME=gcr.io/$GCP_PROJECT_ID/$BITBUCKET_REPO_FULL_NAME${SUFFIX}
+          - docker tag $BITBUCKET_REPO_FULL_NAME ${IMAGE_NAME}
+          # Login to google docker hub
+          - cat ./gcloud-api-key.json | docker login -u _json_key --password-stdin https://gcr.io
+          - docker push ${IMAGE_NAME}
+          - echo "export IMAGE_NAME=$IMAGE_NAME" >> set_env.sh
+        artifacts: # define the artifacts to be passed to each future step
+          - set_env.sh
+    - step: &deploy
+        name: Deploy in GCE
+        image: google/cloud-sdk:latest
+        script:
+          - source set_env.sh
+          - if [ "$BITBUCKET_BRANCH" == opentelemetry ]; then SERVER=$REMOTE_DEV ; fi
+          - if [ "$BITBUCKET_BRANCH" == stage ]; then SERVER=$REMOTE_STAGE ; fi
+          - if [ "$BITBUCKET_BRANCH" == master ]; then SERVER=$REMOTE_MASTER ; fi
+          - export SERVER
+          - pipe: atlassian/ssh-run:0.4.1
+            variables:
+              SSH_USER: '$USERNAME'
+              SERVER: '$SERVER'
+              MODE: 'command'
+              COMMAND: 'sudo ./sync.sh -b $BITBUCKET_BRANCH -i $IMAGE_NAME -s cadence_backend'
+
+pipelines:
+  branches:
+    bitbucket-pipeline-test:
+      - step: *build-image
+      - step: *push-gcp
+      - step: *deploy
+
+    opentelemetry:
+      - step: *build-image
+      - step: *push-gcp
+      - step: *deploy
+
+    stage:
+      - step: *build-image
+      - step: *push-gcp
+      - step: *deploy
+
+    master:
+      - step: *build-image
+      - step: *push-gcp
+      - step: *deploy
